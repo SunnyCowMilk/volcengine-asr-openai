@@ -1,0 +1,12 @@
+version: "3.8"
+
+services:
+  volcengine-asr:
+    build: .
+    image: volcengine-asr-openai:latest
+    container_name: volcengine-asr
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    restart: unless-stopped
