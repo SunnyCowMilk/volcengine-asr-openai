@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional
 
 import aiohttp
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -230,30 +230,33 @@ def parse_response(msg: bytes) -> Dict[str, Any]:
         try:
             payload = gzip_decompress(payload)
             result["payload"] = json.loads(payload.decode("utf-8"))
+        except Exception as e:
+            logger.warning(f"Failed to decompress payload: {e}")
+    elif payload:
+        try:
+            result["payload"] = json.loads(payload.decode("utf-8"))
         except Exception:
-            pass
+            result["payload"] = {"raw": payload.decode("utf-8", errors="ignore")}
 
     return result
 
 
 async def transcribe_audio(audio_data: bytes, language: str = "zh") -> str:
     """Transcribe audio using Volcengine ASR."""
-    # Convert to WAV if needed
-    if not is_wav(audio_data):
-        audio_data = convert_audio_to_wav(audio_data)
+    # Always convert to ensure correct format (16kHz, mono, 16bit)
+    logger.info(f"Original audio size: {len(audio_data)}, is_wav: {is_wav(audio_data)}")
+    wav_data = convert_audio_to_wav(audio_data)
+    logger.info(f"Converted WAV size: {len(wav_data)}")
 
-    # Parse WAV and get audio samples
-    num_channels, samp_width, sample_rate, wave_data = read_wav_info(audio_data)
-
-    # Calculate segment size (200ms)
+    # Calculate segment size based on audio properties (200ms of audio)
+    # 16kHz * 1 channel * 2 bytes * 0.2s = 6400 bytes per segment
     segment_duration_ms = 200
-    size_per_sec = num_channels * samp_width * sample_rate
-    segment_size = size_per_sec * segment_duration_ms // 1000
+    segment_size = DEFAULT_SAMPLE_RATE * 1 * 2 * segment_duration_ms // 1000
 
-    # Split audio into segments
+    # Split the entire WAV file (including header for first segment)
     segments = []
-    for i in range(0, len(wave_data), segment_size):
-        segments.append(wave_data[i:i + segment_size])
+    for i in range(0, len(wav_data), segment_size):
+        segments.append(wav_data[i:i + segment_size])
 
     headers = build_auth_headers()
     final_text = ""
@@ -270,35 +273,55 @@ async def transcribe_audio(audio_data: bytes, language: str = "zh") -> str:
             if msg.type != aiohttp.WSMsgType.BINARY:
                 raise RuntimeError("Unexpected response type")
 
-            # Send audio segments
+            # Send all audio segments quickly (not simulating real-time)
+            logger.info(f"Sending {len(segments)} audio segments")
             for i, segment in enumerate(segments):
                 is_last = i == len(segments) - 1
                 await ws.send_bytes(build_audio_request(seq, segment, is_last))
                 if not is_last:
                     seq += 1
-                await asyncio.sleep(segment_duration_ms / 1000)
+            logger.info("All audio segments sent")
 
-            # Receive all responses
-            async for msg in ws:
-                if msg.type == aiohttp.WSMsgType.BINARY:
-                    result = parse_response(msg.data)
-                    if result["payload"]:
-                        payload = result["payload"]
-                        # Extract text from response
-                        if "result" in payload:
-                            res = payload["result"]
-                            if isinstance(res, list) and res:
-                                final_text = res[-1].get("text", "")
-                            elif isinstance(res, dict):
-                                final_text = res.get("text", "")
-                        if "text" in payload:
-                            final_text = payload["text"]
+            # Receive all responses until we get the final one
+            try:
+                while True:
+                    msg = await asyncio.wait_for(ws.receive(), timeout=30.0)
+                    
+                    if msg.type == aiohttp.WSMsgType.BINARY:
+                        result = parse_response(msg.data)
+                        logger.info(f"ASR response: code={result['code']}, is_last={result['is_last']}")
+                        
+                        if result["payload"]:
+                            payload = result["payload"]
+                            # Extract text from result.text (primary)
+                            if "result" in payload:
+                                res = payload["result"]
+                                if isinstance(res, dict) and res.get("text"):
+                                    final_text = res.get("text", "")
+                                    logger.info(f"Got text: {final_text[:50]}...")
 
-                    if result["is_last"] or result["code"] != 0:
+                        if result["code"] != 0:
+                            error_msg = f"ASR error code: {result['code']}"
+                            if result["payload"]:
+                                error_msg += f", payload: {result['payload']}"
+                            logger.error(error_msg)
+                            raise RuntimeError(error_msg)
+                        
+                        if result["is_last"]:
+                            logger.info("Received final response")
+                            break
+                    elif msg.type == aiohttp.WSMsgType.CLOSE:
+                        logger.info("WebSocket closed by server")
                         break
-                elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
-                    break
+                    elif msg.type == aiohttp.WSMsgType.ERROR:
+                        logger.error(f"WebSocket error: {msg.data}")
+                        break
+            except asyncio.TimeoutError:
+                logger.warning("Timeout waiting for ASR response")
+            except aiohttp.ClientConnectionResetError:
+                logger.info("WebSocket connection closed by server")
 
+    logger.info(f"Final transcription: {final_text}")
     return final_text
 
 
@@ -346,10 +369,13 @@ async def create_transcription(
 
     try:
         audio_data = await file.read()
+        logger.info(f"Received audio file: {file.filename}, size: {len(audio_data)} bytes")
+        
         text = await transcribe_audio(audio_data, language or "zh")
+        logger.info(f"Transcription result: {text[:100] if text else '(empty)'}...")
 
         if response_format == "text":
-            return text
+            return PlainTextResponse(content=text)
         elif response_format == "verbose_json":
             return {"task": "transcribe", "language": language or "zh", "text": text, "segments": []}
         else:  # json
